@@ -1,28 +1,44 @@
-# Pipeline de Importação Automática de Músicas (BEAT//LINE)
+# Pipeline Unificado de Importação de Músicas (BEAT//LINE)
 
-Script automatizado para importar playlists e músicas do YouTube diretamente para o jogo **BEAT//LINE**.
+Script automatizado para importar músicas para o jogo **BEAT//LINE**, suportando tanto **busca direta por nome** quanto **links de playlists do YouTube**.
 
-## 🚀 Como funciona
+## 🚀 Modos de Uso
 
-1. **Download do Áudio:** Utiliza `yt-dlp` para extrair áudio de alta qualidade em formato MP3 (192 kbps).
-2. **Higienização e Enriquecimento de Metadados:**
-   - Remove ruídos comuns em títulos de clipes ("Clipe Oficial", "Ao Vivo", "Remaster", etc.).
-   - Consulta a **iTunes Search API** para descobrir o título canônico, artista oficial, gênero musical e o **ano real de lançamento original** da canção (evitando usar a data de upload do vídeo no YouTube).
-   - Classifica a faixa por década (`Anos 70`, `Anos 80`, `Anos 90`, `Anos 2000`, etc.) e gênero.
-3. **Detecção de Duplicatas:** Checa se a faixa com o mesmo título, artista e ano já existe no banco do Supabase antes de fazer o upload.
-4. **Armazenamento no Cloudflare R2:** Realiza upload autenticado do MP3 via Cloudflare Media API (`https://altigames-media-api.julia-correa-souza.workers.dev/upload`), gerando o link público em `https://audio.altigames.com.br/beatline/musicas/<uuid>.mp3`.
-5. **Cadastro no Supabase:** Cria ou vincula as categorias e insere a faixa na tabela `beatline_tracks`.
-
-## 💻 Como executar
+### 1. Busca Direta por Lista de Músicas (Recomendado)
+Não precisa criar nenhuma playlist no YouTube! O script busca automaticamente cada música no YouTube e seleciona o melhor resultado:
 
 ```bash
-# Executar passando a URL da playlist ou música do YouTube
-python3 scripts/importar_playlist.py "https://www.youtube.com/playlist?list=ID_DA_PLAYLIST"
+# Passando as músicas diretamente via linha de comando:
+python3 scripts/importar_musicas.py --busca "Queen - Bohemian Rhapsody" "A-ha - Take On Me"
+
+# Ou passando um arquivo de texto com 1 música por linha:
+python3 scripts/importar_musicas.py --arquivo musicas.txt
 ```
 
-## 🔐 Configuração e Credenciais
+### 2. Importação via Playlist do YouTube
+Se você tiver um link de playlist ou vídeo do YouTube:
 
-O script busca automaticamente as credenciais em `~/.gemini/beatline_credentials.json` ou através das variáveis de ambiente:
+```bash
+python3 scripts/importar_musicas.py "https://www.youtube.com/playlist?list=ID_DA_PLAYLIST"
+```
+
+---
+
+## 🛠️ O que o pipeline faz por debaixo dos panos
+
+1. **Download do Áudio:** Utiliza `yt-dlp` para buscar e extrair áudio MP3 (192 kbps).
+2. **Higienização de Título:** Remove ruídos como "Clipe Oficial", "Ao Vivo", "Remaster", etc.
+3. **Metadados Canônicos (iTunes Search API):** Identifica o título oficial, artista e o **ano real de lançamento original** da canção.
+4. **Categorias Inteligentes:** Cria/vincula as categorias da década (`Anos 70`, `Anos 80`, etc.), gênero musical e tag `Nacional` se for brasileiro.
+5. **Prevenção de Duplicatas:** Checa no Supabase se a faixa já existe para não gastar upload nem duplicar no catálogo.
+6. **Upload Cloudflare R2:** Envia o arquivo MP3 autenticado para a Media API em `audio.altigames.com.br/beatline/musicas/`.
+7. **Cadastro no Supabase:** Cria os vínculos e adiciona na tabela `beatline_tracks`.
+
+---
+
+## 🔐 Credenciais
+
+O script lê automaticamente de `~/.gemini/beatline_credentials.json` ou de variáveis de ambiente:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `BEATLINE_BOT_EMAIL`
