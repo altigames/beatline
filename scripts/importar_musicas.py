@@ -6,14 +6,14 @@ Suporta:
 1. URLs de Playlists ou Vídeos do YouTube:
    python3 scripts/importar_musicas.py "https://www.youtube.com/playlist?list=..."
 
-2. Listas de Músicas diretamente (sem precisar de playlist no YouTube!):
+2. Listas de Músicas diretamente (busca no YouTube com fallback automático):
    python3 scripts/importar_musicas.py --busca "Queen - Bohemian Rhapsody" "A-ha - Take On Me"
 
 3. Arquivo de texto contendo 1 música por linha:
-   python3 scripts/importar_musicas.py --arquivo musicas.txt
+   python3 scripts/importar_musicas.py --arquivo musicas.txt --categoria Pop
 
-4. Entrada via Pipe/Stdin:
-   cat musicas.txt | python3 scripts/importar_musicas.py
+4. Categorias Guarda-chuva (Guarantees Pop/Rock/Internacional/Nacional for party filtering):
+   python3 scripts/importar_musicas.py --arquivo lista.txt --categoria Pop
 """
 
 import os
@@ -120,6 +120,60 @@ def compute_decade_category(year):
     if decade == 2010: return "Anos 2010"
     if decade >= 2020: return "Anos 2020"
     return None
+
+def build_track_categories(year, genre, artist, title, extra_categories=None):
+    """
+    Constrói a lista inteligente de categorias garantindo:
+    - Década correta (ex: Anos 2000, Anos 2010)
+    - Subgênero técnico do iTunes (ex: Alternative, Contemporary R&B, Dance)
+    - Macro-categorias guarda-chuva para filtros casuais (Pop, Rock)
+    - Origem (Nacional vs Internacional)
+    - Categorias explicitamente passadas pelo usuário/lote
+    """
+    categories = []
+
+    # 1. Década
+    dec = compute_decade_category(year)
+    if dec:
+        categories.append(dec)
+
+    # 2. Gênero específico do iTunes
+    clean_genre = genre.strip() if genre else ""
+    if clean_genre and len(clean_genre) <= 30:
+        categories.append(clean_genre.title())
+
+    # 3. Macro-categorias Guarda-chuva
+    genre_upper = clean_genre.upper()
+
+    # Se for vertente de Rock -> inclui Rock
+    rock_keywords = ['ROCK', 'METAL', 'GRUNGE', 'PUNK', 'INDIE', 'ALTERNATIVE']
+    if any(k in genre_upper for k in rock_keywords):
+        if 'Rock' not in categories:
+            categories.append('Rock')
+
+    # Se for vertente de Pop / rádio hits / dance / r&b / rap mainstream -> inclui Pop
+    pop_keywords = ['POP', 'DANCE', 'ELECTRONIC', 'DISCO', 'R&B', 'SOUL', 'SYNTH', 'TEEN', 'HIP-HOP', 'RAP']
+    if any(k in genre_upper for k in pop_keywords):
+        if 'Pop' not in categories:
+            categories.append('Pop')
+
+    # 4. Origem: Nacional vs Internacional
+    is_nacional = any(w in artist.lower() or w in title.lower() for w in ['sertanejo', 'mpb', 'brasil', 'funk', 'pagode', 'forró', 'axé', 'samba'])
+    if is_nacional:
+        if 'Nacional' not in categories:
+            categories.append('Nacional')
+    else:
+        if 'Internacional' not in categories:
+            categories.append('Internacional')
+
+    # 5. Categorias extras passadas pelo usuário
+    if extra_categories:
+        for ec in extra_categories:
+            ec_clean = ec.strip().title()
+            if ec_clean and ec_clean not in categories:
+                categories.append(ec_clean)
+
+    return categories
 
 def authenticate_bot(creds):
     supa_url = creds['supabase_url']
@@ -271,7 +325,7 @@ def get_ytdlp_base_cmd():
         return ["uv", "tool", "run", "yt-dlp"]
     return [sys.executable, "-m", "yt_dlp"]
 
-def process_music_import(items, is_playlist=False):
+def process_music_import(items, is_playlist=False, extra_categories=None):
     """
     Processa uma lista de buscas ("Artista - Música") ou uma URL de Playlist.
     """
@@ -294,7 +348,11 @@ def process_music_import(items, is_playlist=False):
 
     base_cmd = get_ytdlp_base_cmd()
 
-    # Montar comando de download
+    sucessos = 0
+    duplicadas = 0
+    falhas = 0
+    cadastradas = []
+
     if is_playlist:
         playlist_url = items[0]
         print(f"\n→ Modo Playlist: Extraindo áudios de: {playlist_url}")
@@ -309,148 +367,166 @@ def process_music_import(items, is_playlist=False):
             "--no-playlist" if ("watch?v=" in playlist_url and "list=" not in playlist_url) else "--yes-playlist",
             playlist_url
         ]
-        subprocess.run(ydl_cmd, check=True)
-    else:
-        # Modo Lista de Músicas com busca direta (ytsearch1:)
-        print(f"\n→ Modo Lista: Processando {len(items)} música(s) via busca direta no YouTube...")
-        batch_file = work_dir / "batch_queries.txt"
-        with open(batch_file, "w", encoding="utf-8") as bf:
-            for item in items:
-                clean_item = item.strip()
-                if clean_item:
-                    # Prefixo ytsearch1: para buscar o primeiro resultado mais relevante no YouTube
-                    bf.write(f"ytsearch1:{clean_item}\n")
+        subprocess.run(ydl_cmd, check=False)
 
-        ydl_cmd = base_cmd + [
-            "--format", "bestaudio/best",
-            "--extract-audio",
-            "--audio-format", "mp3",
-            "--audio-quality", "192K",
-            "--output", str(work_dir / "%(autonumber)03d - %(title)s.%(ext)s"),
-            "--write-info-json",
-            "--ignore-errors",
-            "--batch-file", str(batch_file)
-        ]
-        subprocess.run(ydl_cmd, check=True)
+        mp3_files = sorted(work_dir.glob("*.mp3"))
+        print(f"\n✓ Download concluído: {len(mp3_files)} áudio(s) obtido(s).\n")
 
-    mp3_files = sorted(work_dir.glob("*.mp3"))
-    print(f"\n✓ Download concluído: {len(mp3_files)} áudio(s) obtido(s).\n")
+        for idx, mp3 in enumerate(mp3_files, start=1):
+            print(f"\n[{idx}/{len(mp3_files)}] Processando: {mp3.name}")
+            info_json = mp3.with_suffix('.info.json')
+            meta = {}
+            if info_json.exists():
+                try:
+                    with open(info_json, 'r', encoding='utf-8') as f:
+                        meta = json.load(f)
+                except Exception:
+                    pass
 
-    if not mp3_files:
-        print("[!] Nenhum áudio foi baixado.")
-        return
+            raw_title = meta.get('title', mp3.stem)
+            uploader = meta.get('uploader', '') or meta.get('channel', '')
+            artist_meta = meta.get('artist', '')
+            track_meta = meta.get('track', '')
 
-    sucessos = 0
-    duplicadas = 0
-    falhas = 0
-    cadastradas = []
+            cleaned_title = clean_youtube_title(raw_title)
+            if track_meta and artist_meta:
+                title, artist = track_meta, artist_meta
+            elif ' - ' in cleaned_title:
+                parts = cleaned_title.split(' - ', 1)
+                artist, title = parts[0].strip(), parts[1].strip()
+            else:
+                title = cleaned_title
+                artist = uploader.replace(' - Topic', '').replace('VEVO', '').strip()
 
-    for idx, mp3 in enumerate(mp3_files, start=1):
-        print(f"\n[{idx}/{len(mp3_files)}] Processando: {mp3.name}")
-        info_json = mp3.with_suffix('.info.json')
-        meta = {}
-        if info_json.exists():
+            itunes = search_itunes_metadata(f"{artist} {title}")
+            year, genre = None, None
+            if itunes and itunes['year']:
+                title = itunes['title'] or title
+                artist = itunes['artist'] or artist
+                year = itunes['year']
+                genre = itunes.get('genre')
+            else:
+                year = meta.get('release_year') or (int(meta['upload_date'][:4]) if meta.get('upload_date') else 2000)
+
+            categories = build_track_categories(year, genre, artist, title, extra_categories=extra_categories)
+
+            if check_duplicate_track(supa_url, service_key, title, artist, year):
+                print(f"  [Pular] Já existe: '{title}' - '{artist}' ({year})")
+                duplicadas += 1
+                continue
+
             try:
-                with open(info_json, 'r', encoding='utf-8') as f:
-                    meta = json.load(f)
-            except Exception:
-                pass
+                r2_filename = upload_mp3_to_cloudflare(mp3, bot_token)
+                cat_ids = get_or_create_categories(supa_url, service_key, categories)
+                track_id = register_track_in_supabase(supa_url, service_key, title, artist, year, r2_filename, cat_ids)
+                print(f"  ✓ Cadastrada! ID: {track_id} ({artist} - {title}, {year}) | {categories}")
+                sucessos += 1
+                cadastradas.append({'title': title, 'artist': artist, 'year': year, 'categories': categories})
+            except Exception as e:
+                print(f"  [ERRO] Falha ao cadastrar: {e}")
+                falhas += 1
 
-        raw_title = meta.get('title', mp3.stem)
-        uploader = meta.get('uploader', '') or meta.get('channel', '')
-        artist_meta = meta.get('artist', '')
-        track_meta = meta.get('track', '')
+    else:
+        # Modo Lista com Busca Direta no YouTube (ytsearch5 com max-downloads 1)
+        print(f"\n→ Modo Lista: Processando {len(items)} música(s) via busca direta no YouTube...\n")
 
-        # Limpar título
-        cleaned_title = clean_youtube_title(raw_title)
+        for idx, item in enumerate(items, start=1):
+            clean_item = item.strip()
+            if not clean_item:
+                continue
 
-        title = ""
-        artist = ""
+            print(f"[{idx}/{len(items)}] Buscando metadados: '{clean_item}'")
+            itunes = search_itunes_metadata(clean_item)
+            expected_title = clean_item
+            expected_artist = ""
+            year = None
+            genre = None
 
-        if track_meta and artist_meta:
-            title = track_meta
-            artist = artist_meta
-        elif ' - ' in cleaned_title:
-            parts = cleaned_title.split(' - ', 1)
-            artist = parts[0].strip()
-            title = parts[1].strip()
-        else:
-            title = cleaned_title
-            artist = uploader.replace(' - Topic', '').replace('VEVO', '').strip()
+            if itunes and itunes['year']:
+                expected_title = itunes['title']
+                expected_artist = itunes['artist']
+                year = itunes['year']
+                genre = itunes.get('genre')
+                print(f"  ✓ iTunes: '{expected_title}' por '{expected_artist}' ({year}) [{genre}]")
+            elif ' - ' in clean_item:
+                parts = clean_item.split(' - ', 1)
+                expected_artist = parts[0].strip()
+                expected_title = parts[1].strip()
 
-        # Buscar dados oficiais no iTunes para pegar o ANO REAL DE LANÇAMENTO
-        print(f"  → Buscando metadados oficiais para '{title}' ({artist})...")
-        itunes = search_itunes_metadata(f"{artist} {title}")
-        
-        year = None
-        genre = None
+            if expected_artist and check_duplicate_track(supa_url, service_key, expected_title, expected_artist, year):
+                print(f"  [Pular] Já cadastrada no banco: '{expected_title}' - '{expected_artist}' ({year or '?'})")
+                duplicadas += 1
+                continue
 
-        if itunes and itunes['year']:
-            print(f"  ✓ Encontrado no catálogo oficial: {itunes['title']} por {itunes['artist']} ({itunes['year']})")
-            title = itunes['title'] or title
-            artist = itunes['artist'] or artist
-            year = itunes['year']
-            genre = itunes.get('genre')
-        else:
-            year = meta.get('release_year')
-            if not year and meta.get('upload_date'):
-                year = int(meta['upload_date'][:4])
-            print(f"  [Aviso] Usando ano alternativo: {year}")
+            item_dir = work_dir / f"item_{idx:03d}"
+            item_dir.mkdir(parents=True, exist_ok=True)
 
-        if not year or year < 1900 or year > 2100:
-            year = 2000
+            search_query = f"{expected_artist} {expected_title}".strip() if expected_artist else clean_item
+            print(f"  → Baixando do YouTube: '{search_query}'...")
 
-        # Montar categorias
-        categories = []
-        decade = compute_decade_category(year)
-        if decade:
-            categories.append(decade)
-        if genre and len(genre) <= 30:
-            categories.append(genre)
+            ydl_cmd = base_cmd + [
+                "--format", "bestaudio/best",
+                "--extract-audio",
+                "--audio-format", "mp3",
+                "--audio-quality", "192K",
+                "--max-downloads", "1",
+                "--output", str(item_dir / "%(title)s.%(ext)s"),
+                "--write-info-json",
+                "--ignore-errors",
+                f"ytsearch5:{search_query}"
+            ]
+            subprocess.run(ydl_cmd, check=False)
 
-        if any(w in uploader.lower() or w in raw_title.lower() for w in ['sertanejo', 'mpb', 'brasil', 'funk', 'pagode']):
-            if 'Nacional' not in categories:
-                categories.append('Nacional')
+            downloaded_mp3s = list(item_dir.glob("*.mp3"))
+            if not downloaded_mp3s:
+                print(f"  [✕] Não foi possível baixar áudio para '{clean_item}'")
+                falhas += 1
+                shutil.rmtree(item_dir, ignore_errors=True)
+                continue
 
-        print(f"  → Dados finais: '{title}' | Artista: '{artist}' | Ano: {year} | Categorias: {categories}")
+            mp3 = downloaded_mp3s[0]
 
-        # Checar duplicatas no Supabase
-        if check_duplicate_track(supa_url, service_key, title, artist, year):
-            print(f"  [Pular] Música já existente no catálogo: '{title}' - '{artist}' ({year})")
-            duplicadas += 1
-            continue
+            if not year:
+                info_json = mp3.with_suffix('.info.json')
+                if info_json.exists():
+                    try:
+                        with open(info_json, 'r', encoding='utf-8') as f:
+                            yt_meta = json.load(f)
+                            year = yt_meta.get('release_year') or (int(yt_meta['upload_date'][:4]) if yt_meta.get('upload_date') else None)
+                    except Exception:
+                        pass
+                if not year or year < 1900 or year > 2100:
+                    year = 2000
 
-        try:
-            # 1. Upload do MP3 para Cloudflare R2 via Media API
-            print("  → Enviando MP3 para a Cloudflare Media API...")
-            r2_filename = upload_mp3_to_cloudflare(mp3, bot_token)
-            print(f"  ✓ MP3 salvo com sucesso: {r2_filename}")
+            categories = build_track_categories(year, genre, expected_artist, expected_title, extra_categories=extra_categories)
 
-            # 2. Obter ou criar categorias no Supabase
-            cat_ids = get_or_create_categories(supa_url, service_key, categories)
+            try:
+                print("  → Enviando MP3 para Cloudflare R2...")
+                r2_filename = upload_mp3_to_cloudflare(mp3, bot_token)
+                print(f"  ✓ MP3 salvo: {r2_filename}")
 
-            # 3. Registrar música no Supabase
-            print("  → Registrando no Supabase...")
-            track_id = register_track_in_supabase(supa_url, service_key, title, artist, year, r2_filename, cat_ids)
-            print(f"  ✓ Cadastrada com sucesso! (ID: {track_id})")
-            sucessos += 1
-            cadastradas.append({
-                'title': title,
-                'artist': artist,
-                'year': year,
-                'categories': categories,
-                'file_path': r2_filename
-            })
-
-        except Exception as e:
-            print(f"  [ERRO] Falha ao processar música '{title}': {e}")
-            falhas += 1
+                cat_ids = get_or_create_categories(supa_url, service_key, categories)
+                track_id = register_track_in_supabase(supa_url, service_key, expected_title, expected_artist, year, r2_filename, cat_ids)
+                print(f"  ✓ CADASTRADA NO JOGO! ID: {track_id} | Ano: {year} | Categorias: {categories}")
+                sucessos += 1
+                cadastradas.append({
+                    'title': expected_title,
+                    'artist': expected_artist,
+                    'year': year,
+                    'categories': categories,
+                    'file_path': r2_filename
+                })
+            except Exception as e:
+                print(f"  [ERRO] Falha ao cadastrar '{expected_title}': {e}")
+                falhas += 1
+            finally:
+                shutil.rmtree(item_dir, ignore_errors=True)
 
     shutil.rmtree(work_dir, ignore_errors=True)
 
     print("\n" + "=" * 65)
     print("RESUMO DA IMPORTAÇÃO:")
-    print(f"  Total de músicas baixadas:    {len(mp3_files)}")
+    print(f"  Total solicitado:              {len(items)}")
     print(f"  ✓ Cadastradas com sucesso:     {sucessos}")
     print(f"  ⚠ Já existentes (duplicadas):   {duplicadas}")
     print(f"  ✕ Falhas:                      {falhas}")
@@ -464,11 +540,13 @@ def main():
     parser.add_argument('--arquivo', '-a', help="Caminho para arquivo de texto com 1 música por linha")
     parser.add_argument('--busca', '-b', nargs='+', help="Lista de músicas para pesquisar no YouTube")
     parser.add_argument('--playlist', '-p', help="URL de playlist do YouTube")
+    parser.add_argument('--categoria', '-c', nargs='+', help="Categorias adicionais obrigatórias para todas as músicas (ex: Pop, Rock)")
 
     args = parser.parse_args()
 
     items = []
     is_playlist = False
+    extra_categories = args.categoria or []
 
     if args.playlist:
         items = [args.playlist]
@@ -489,7 +567,6 @@ def main():
         else:
             items = args.targets
     elif not sys.stdin.isatty():
-        # Lendo de stdin
         items = [line.strip() for line in sys.stdin if line.strip() and not line.startswith('#')]
     else:
         entrada = input("Cole o link da playlist OU digite as músicas (Artista - Nome): ").strip()
@@ -503,7 +580,7 @@ def main():
         print("Nenhuma música ou URL fornecida.")
         sys.exit(1)
 
-    process_music_import(items, is_playlist=is_playlist)
+    process_music_import(items, is_playlist=is_playlist, extra_categories=extra_categories)
 
 if __name__ == '__main__':
     main()
